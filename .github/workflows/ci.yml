@@ -11,12 +11,12 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install checks
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
         run: |
-          shellcheck install.sh lib/*.sh scripts/* tests/*.sh
+          shellcheck -x install.sh lib/*.sh scripts/* tests/*.sh
       - name: Smoke tests
         run: |
           bash tests/smoke.sh
@@ -25,7 +25,7 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Reject likely live deployment files
         run: |
           test -z "$(find . -type f \( -name '*.db' -o -name '*.sqlite' \) -print)"

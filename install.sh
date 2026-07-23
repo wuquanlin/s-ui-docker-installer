@@ -230,7 +230,7 @@ EOF
 main() {
   parse_args "$@"
   require_root "$@"
-  detect_platform
+  detect_platform /etc/os-release
   install_base_packages
   prompt_inputs
   validate_options
