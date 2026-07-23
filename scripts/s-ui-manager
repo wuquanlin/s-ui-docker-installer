@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="/etc/s-ui-installer/config.env"
+[[ -r "$CONFIG_FILE" ]] || {
+  printf 'S-UI installer state not found: %s\n' "$CONFIG_FILE" >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+log() { printf '\n[+] %s\n' "$*"; }
+warn() { printf '\n[!] %s\n' "$*" >&2; }
+die() { printf '\n[x] %s\n' "$*" >&2; exit 1; }
+timestamp() { date -u +%Y%m%dT%H%M%SZ; }
+
+[[ "$SUI_DIR" == /* && "$SUI_DIR" != "/" && "$SUI_DIR" != "/root" ]] ||
+  die "Unsafe SUI_DIR in ${CONFIG_FILE}"
+[[ "$BACKUP_ROOT" == /* && "$BACKUP_ROOT" != "/" ]] ||
+  die "Unsafe BACKUP_ROOT in ${CONFIG_FILE}"
+
+compose() {
+  (cd "$SUI_DIR" && docker compose "$@")
+}
+
+status_cmd() {
+  compose ps
+  printf '\nPublished ports:\n'
+  docker port s-ui 2>/dev/null | sort || true
+  printf '\nCertificate:\n'
+  openssl x509 -in "$CERT_DEST" -noout -subject -issuer -dates \
+    -ext subjectAltName 2>/dev/null || true
+  printf '\nSystem:\n'
+  sysctl net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc net.ipv4.ip_forward 2>/dev/null || true
+}
+
+doctor_cmd() {
+  local failures=0
+  log "Container"
+  if docker inspect s-ui --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    printf 'PASS: s-ui is running\n'
+  else
+    printf 'FAIL: s-ui is not running\n'
+    failures=$((failures + 1))
+  fi
+
+  log "Ports"
+  local expected=""
+  for expected in "${WEB_PORT}/tcp" "${SUB_PORT}/tcp" "443/tcp" "443/udp" "8443/tcp"; do
+    if docker port s-ui 2>/dev/null | grep -q "^${expected}"; then
+      printf 'PASS: %s\n' "$expected"
+    else
+      printf 'FAIL: %s\n' "$expected"
+      failures=$((failures + 1))
+    fi
+  done
+
+  log "Certificate"
+  if openssl x509 -in "$CERT_DEST" -noout -checkhost "$DOMAIN" 2>/dev/null |
+     grep -q 'does match'; then
+    printf 'PASS: certificate matches %s\n' "$DOMAIN"
+  else
+    printf 'WARN: certificate does not match %s (possibly self-signed example)\n' "$DOMAIN"
+  fi
+  if openssl x509 -checkend 1209600 -noout -in "$CERT_DEST" >/dev/null 2>&1; then
+    printf 'PASS: certificate valid for more than 14 days\n'
+  else
+    printf 'FAIL: certificate expires within 14 days\n'
+    failures=$((failures + 1))
+  fi
+
+  log "Panel HTTPS"
+  local code=""
+  code="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "${DOMAIN}:${WEB_PORT}:127.0.0.1" \
+    --connect-timeout 5 --max-time 12 \
+    "https://${DOMAIN}:${WEB_PORT}${WEB_PATH}" 2>/dev/null || true)"
+  case "$code" in
+    200|301|302|303|307|308) printf 'PASS: HTTP %s\n' "$code" ;;
+    *)
+      printf 'FAIL: HTTP %s\n' "${code:-000}"
+      failures=$((failures + 1))
+      ;;
+  esac
+
+  (( failures == 0 )) || die "Doctor found ${failures} failure(s)"
+  log "All required checks passed"
+}
+
+backup_cmd() {
+  local target=""
+  target="${BACKUP_ROOT}/$(timestamp)"
+  install -m 0700 -d "$target"
+  sqlite3 "${SUI_DIR}/db/s-ui.db" ".backup '${target}/s-ui.db'"
+  chmod 0600 "${target}/s-ui.db"
+  cp -a "${SUI_DIR}/docker-compose.yml" "${SUI_DIR}/.env" "$target/"
+  cp -a "${SUI_DIR}/cert" "$target/"
+  printf '%s\n' "$target" >"${BACKUP_ROOT}/latest"
+  printf '%s\n' "$target"
+}
+
+restore_cmd() {
+  local source="${1:-}"
+  [[ -d "$source" ]] || die "Backup directory not found: ${source}"
+  [[ -f "${source}/s-ui.db" ]] || die "Backup has no s-ui.db"
+  local safety=""
+  safety="$(backup_cmd)"
+  log "Safety backup: ${safety}"
+  compose stop s-ui
+  install -m 0600 "${source}/s-ui.db" "${SUI_DIR}/db/s-ui.db"
+  [[ -d "${source}/cert" ]] && {
+    local old_cert_dir=""
+    old_cert_dir="${SUI_DIR}/cert.before-restore.$(timestamp)"
+    [[ -d "${SUI_DIR}/cert" ]] &&
+      mv "${SUI_DIR}/cert" "$old_cert_dir"
+    cp -a "${source}/cert" "${SUI_DIR}/cert"
+  }
+  compose up -d
+}
+
+cert_sync_cmd() {
+  [[ -f "$CERT_SOURCE" && -f "$KEY_SOURCE" ]] || {
+    warn "Certificate source is unavailable; skipped"
+    return 0
+  }
+  openssl x509 -in "$CERT_SOURCE" -noout >/dev/null 2>&1 ||
+    die "Source certificate is invalid"
+  openssl pkey -in "$KEY_SOURCE" -noout >/dev/null 2>&1 ||
+    die "Source private key is invalid"
+
+  local changed=0
+  cmp -s "$CERT_SOURCE" "$CERT_DEST" || {
+    install -m 0644 "$CERT_SOURCE" "$CERT_DEST"
+    changed=1
+  }
+  cmp -s "$KEY_SOURCE" "$KEY_DEST" || {
+    install -m 0600 "$KEY_SOURCE" "$KEY_DEST"
+    changed=1
+  }
+  if (( changed == 1 )); then
+    compose restart s-ui
+    log "Certificate synchronized and S-UI restarted"
+  else
+    printf 'Certificate is already current.\n'
+  fi
+}
+
+update_cmd() {
+  local release_json=""
+  local latest=""
+  release_json="$(curl -4 -fsSL --connect-timeout 5 --max-time 15 \
+    https://api.github.com/repos/alireza0/s-ui/releases/latest 2>/dev/null || true)"
+  latest="$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    die "Unable to resolve latest official S-UI release"
+
+  local image="alireza7/s-ui:${latest}"
+  if ! docker pull "$image"; then
+    [[ "$DETECTED_REGION" == "china" ]] ||
+      die "Unable to pull ${image}"
+    image="docker.m.daocloud.io/alireza7/s-ui:${latest}"
+    docker pull "$image"
+  fi
+
+  backup_cmd >/dev/null
+  local old_env=""
+  old_env="$(mktemp)"
+  cp -a "${SUI_DIR}/.env" "$old_env"
+  local temp=""
+  temp="$(mktemp)"
+  awk -v image="$image" '
+    /^SUI_IMAGE=/ { print "SUI_IMAGE=" image; found=1; next }
+    { print }
+    END { if (!found) print "SUI_IMAGE=" image }
+  ' "${SUI_DIR}/.env" >"$temp"
+  install -m 0600 "$temp" "${SUI_DIR}/.env"
+  rm -f "$temp"
+  if ! compose up -d; then
+    install -m 0600 "$old_env" "${SUI_DIR}/.env"
+    rm -f "$old_env"
+    compose up -d || true
+    die "Update failed; previous image configuration restored"
+  fi
+
+  local _attempt=0
+  for _attempt in $(seq 1 30); do
+    if docker inspect s-ui --format '{{.State.Running}}' 2>/dev/null |
+       grep -q true; then
+      rm -f "$old_env"
+      printf 'Updated S-UI to %s\n' "$latest"
+      return 0
+    fi
+    sleep 1
+  done
+
+  install -m 0600 "$old_env" "${SUI_DIR}/.env"
+  rm -f "$old_env"
+  compose up -d || true
+  die "Updated container did not become healthy; previous image restored"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: s-ui-manager COMMAND
+
+Commands:
+  status                 Show container, ports, certificate, and sysctl
+  doctor                 Run required health checks
+  logs [N]               Show recent logs (default: 150 lines)
+  update                 Backup and update to latest official S-UI
+  backup                 Create an online SQLite/config/certificate backup
+  restore DIR            Restore a backup after creating a safety backup
+  cert-sync              Copy renewed source certificate and restart if changed
+  restart|start|stop     Control the S-UI container
+  uninstall              Stop S-UI but preserve all data and backups
+EOF
+}
+
+case "${1:-}" in
+  status) status_cmd ;;
+  doctor) doctor_cmd ;;
+  logs) compose logs --tail="${2:-150}" s-ui ;;
+  update) update_cmd ;;
+  backup) backup_cmd ;;
+  restore) restore_cmd "${2:-}" ;;
+  cert-sync) cert_sync_cmd ;;
+  restart) compose restart s-ui ;;
+  start) compose up -d ;;
+  stop) compose stop s-ui ;;
+  uninstall)
+    compose down
+    systemctl disable --now s-ui-cert-sync.timer 2>/dev/null || true
+    printf 'S-UI stopped. Data preserved in %s\n' "$SUI_DIR"
+    ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

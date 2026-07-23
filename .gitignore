@@ -1,0 +1,28 @@
+# Runtime and secrets
+.env
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+install-report.txt
+backups/
+dist/
+
+# Certificates and private keys are ignored by default.
+*.key
+*.pem
+*.crt
+*.cer
+certs/live/*
+!certs/live/.gitkeep
+
+# The deliberately public, invalid-host development pair is tracked.
+!certs/examples/development-private.key
+!certs/examples/development-fullchain.pem
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
