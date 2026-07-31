@@ -22,6 +22,7 @@ jobs:
           bash tests/smoke.sh
           bash tests/network-selection.sh
           bash tests/certificate-management.sh
+          bash tests/input-validation.sh
 
   secret-scan:
     runs-on: ubuntu-latest

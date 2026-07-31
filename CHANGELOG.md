@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1
+
+- Stop immediately when an existing installation is detected without `--upgrade`.
+- Validate domain syntax as soon as it is entered.
+- Require the domain A/AAAA records to match the VPS public IP by default.
+- Add `--expected-ip` for multi-address/NAT deployments and
+  `--skip-domain-ip-check` for deliberate CDN or reverse-proxy setups.
+- Validate explicit certificate/key paths, PEM format, pairing, hostname, and
+  expiry during interactive input.
+- Reject expired certificates and encrypted/unattended private keys.
+
 ## 1.1.0
 
 - Add `cert-status` to show configured source and installed certificate paths.

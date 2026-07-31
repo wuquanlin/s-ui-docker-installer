@@ -68,6 +68,33 @@ sudo ./install.sh \
 未提供 `--admin-pass` 时会生成随机密码，并在终端显示一次。完整安装报告保存在
 `/opt/s-ui/install-report.txt`，权限为 `0600`。
 
+### 输入即时校验
+
+交互安装会在读取下一项之前完成当前输入的校验：
+
+- 启动时先检查安装目录；发现已有 `/opt/s-ui` 时立即停止，并提示使用
+  `--upgrade`，不会再进入域名和证书提问。
+- 域名必须符合完整域名格式，并且其 A/AAAA 记录默认必须至少有一个匹配
+  当前 VPS 的公网 IPv4/IPv6。
+- 手工指定的证书和私钥必须真实存在、可读取、为有效 PEM、互相匹配、
+  匹配输入域名且尚未过期。
+- 加密私钥会被拒绝，因为 S-UI 无法在无人值守重启时交互输入密码。
+
+使用 NAT、多公网 IP 时可以明确指定预期地址：
+
+```bash
+sudo ./install.sh --domain panel.example.com --expected-ip 203.0.113.10
+```
+
+只有在确定域名经过 CDN 或反向代理、DNS 本来就不应直指 VPS 时才跳过
+IP 匹配检查：
+
+```bash
+sudo ./install.sh --domain panel.example.com --skip-domain-ip-check
+```
+
+这只跳过 DNS 与本机公网 IP 的比较，不会跳过域名格式或证书校验。
+
 ### 中国 VPS
 
 通常不需要额外参数：

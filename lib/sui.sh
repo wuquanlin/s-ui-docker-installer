@@ -5,7 +5,7 @@ check_existing_install() {
   if [[ -e "${SUI_DIR}/docker-compose.yml" || -e "${SUI_DIR}/db/s-ui.db" ]]; then
     EXISTING_INSTALL=1
     [[ "$UPGRADE" == "1" ]] ||
-      die "发现现有安装 ${SUI_DIR}；如需保留数据升级，请使用 --upgrade"
+      die "发现现有安装 ${SUI_DIR}；完整升级请使用 --upgrade，单独更新证书请使用 s-ui-manager cert-set CERT KEY"
   fi
 }
 

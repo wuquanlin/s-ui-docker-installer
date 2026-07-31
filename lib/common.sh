@@ -92,11 +92,25 @@ validate_port() {
   (( value >= 1 && value <= 65535 )) || die "${name} 超出范围：${value}"
 }
 
+domain_is_valid() {
+  local value="$1"
+  local label=""
+  local -a labels=()
+
+  [[ ${#value} -le 253 && "$value" == *.* && "$value" != *..* ]] ||
+    return 1
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
+      return 1
+  done
+}
+
 validate_domain() {
   local value="$1"
-  [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
-    die "域名格式无效：${value}"
-  [[ "$value" == *.* ]] || die "请输入完整域名，例如 panel.example.com"
+  domain_is_valid "$value" ||
+    die "域名格式无效：${value}（必须是完整域名，且每个标签只能包含字母、数字和连字符）"
 }
 
 validate_http_url() {

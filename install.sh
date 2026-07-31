@@ -52,6 +52,9 @@ OPEN_FIREWALL="${OPEN_FIREWALL:-1}"
 UPGRADE="${UPGRADE:-0}"
 FORCE_PORTS="${FORCE_PORTS:-0}"
 SKIP_CERT_HOST_CHECK="${SKIP_CERT_HOST_CHECK:-0}"
+SKIP_DOMAIN_IP_CHECK="${SKIP_DOMAIN_IP_CHECK:-0}"
+EXPECTED_PUBLIC_IP="${EXPECTED_PUBLIC_IP:-}"
+DOMAIN_IP_VALIDATED=0
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 ASSUME_Y="${ASSUME_Y:-0}"
 
@@ -88,6 +91,8 @@ S-UI Docker 自动安装器
   --allow-docker-restart       有其他容器时也允许重启 Docker
   --no-firewall                不修改 UFW/firewalld
   --skip-cert-host-check       允许正式证书与域名不匹配
+  --expected-ip IP             指定域名必须解析到的本机公网 IP
+  --skip-domain-ip-check       使用 CDN/反向代理时跳过域名与本机 IP 校验
   --noninteractive             禁用交互
   -y, --yes                    自动确认安装摘要
   -h, --help                   显示帮助
@@ -123,6 +128,8 @@ parse_args() {
       --allow-docker-restart) ALLOW_DOCKER_RESTART=1; shift ;;
       --no-firewall) OPEN_FIREWALL=0; shift ;;
       --skip-cert-host-check) SKIP_CERT_HOST_CHECK=1; shift ;;
+      --expected-ip) EXPECTED_PUBLIC_IP="${2:-}"; shift 2 ;;
+      --skip-domain-ip-check) SKIP_DOMAIN_IP_CHECK=1; shift ;;
       --noninteractive) NONINTERACTIVE=1; shift ;;
       -y|--yes) ASSUME_Y=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -155,17 +162,93 @@ validate_options() {
   esac
 }
 
+validate_expected_public_ip() {
+  if [[ -n "$EXPECTED_PUBLIC_IP" ]]; then
+    EXPECTED_PUBLIC_IP="$(normalize_ip "$EXPECTED_PUBLIC_IP" 2>/dev/null)" ||
+      die "--expected-ip 不是有效的 IPv4/IPv6 地址"
+  fi
+}
+
+validate_install_target() {
+  [[ "$SUI_DIR" == /* && "$SUI_DIR" != "/" && "$SUI_DIR" != "/root" ]] ||
+    die "--dir 必须是安全的绝对路径，且不能为 / 或 /root"
+  [[ "$BACKUP_ROOT" == /* && "$BACKUP_ROOT" != "/" ]] ||
+    die "BACKUP_ROOT 必须是安全的绝对路径"
+}
+
+prompt_domain_input() {
+  local candidate=""
+
+  while true; do
+    candidate="$(prompt_value "面板/订阅域名" "$DOMAIN" 1)"
+    if ! domain_is_valid "$candidate"; then
+      warn "域名格式无效：${candidate}"
+      DOMAIN=""
+      continue
+    fi
+    DOMAIN="$candidate"
+    if [[ "$SKIP_DOMAIN_IP_CHECK" == "1" ]]; then
+      warn "已按参数跳过域名到本机公网 IP 的校验"
+      DOMAIN_IP_VALIDATED=1
+      return 0
+    fi
+    if check_domain_points_to_server; then
+      info "域名解析校验通过：$(tr '\n' ' ' <<<"$DOMAIN_DNS_IPS" | xargs)"
+      DOMAIN_IP_VALIDATED=1
+      return 0
+    fi
+    warn "$DOMAIN_IP_VALIDATION_ERROR"
+    warn "请修正 DNS 后重试，或使用 --skip-domain-ip-check 明确跳过"
+    DOMAIN=""
+  done
+}
+
+prompt_certificate_inputs() {
+  local candidate_cert=""
+  local candidate_key=""
+
+  while true; do
+    candidate_cert="$(prompt_value "证书路径（留空自动查找）" "$CERT_SRC" 0)"
+    if [[ -z "$candidate_cert" ]]; then
+      CERT_SRC=""
+      KEY_SRC=""
+      return 0
+    fi
+    if ! certificate_file_is_valid "$candidate_cert"; then
+      warn "$CERT_VALIDATION_ERROR"
+      CERT_SRC=""
+      continue
+    fi
+    CERT_SRC="$candidate_cert"
+    break
+  done
+
+  while true; do
+    candidate_key="$(prompt_value "私钥路径" "$KEY_SRC" 1)"
+    if ! private_key_file_is_valid "$candidate_key"; then
+      warn "$KEY_VALIDATION_ERROR"
+      KEY_SRC=""
+      continue
+    fi
+    if ! certificate_matches_key "$CERT_SRC" "$candidate_key"; then
+      warn "证书和私钥不匹配：${candidate_key}"
+      KEY_SRC=""
+      continue
+    fi
+    KEY_SRC="$candidate_key"
+    info "证书、私钥、域名和有效期校验通过"
+    return 0
+  done
+}
+
 prompt_inputs() {
   if ! is_interactive; then
     return 0
   fi
   printf '\nS-UI Docker 自动安装器\n'
   printf '按 Enter 接受方括号中的默认值。\n\n'
-  DOMAIN="$(prompt_value "面板/订阅域名" "$DOMAIN" 1)"
-  CERT_SRC="$(prompt_value "证书路径（留空自动查找）" "$CERT_SRC" 0)"
-  if [[ -n "$CERT_SRC" ]]; then
-    KEY_SRC="$(prompt_value "私钥路径" "$KEY_SRC" 1)"
-  fi
+  prompt_domain_input
+  prompt_certificate_inputs
   DB_SRC="$(prompt_value "已有 s-ui.db（留空新装）" "$DB_SRC" 0)"
   if [[ -n "$DB_SRC" ]]; then
     OLD_DOMAIN="$(prompt_value "旧域名（留空自动发现）" "$OLD_DOMAIN" 0)"
@@ -230,15 +313,18 @@ EOF
 main() {
   parse_args "$@"
   require_root "$@"
+  validate_install_target
+  check_existing_install
   detect_platform /etc/os-release
   install_base_packages
+  validate_expected_public_ip
   prompt_inputs
   validate_options
+  validate_domain_points_to_server
   detect_network_profile
   select_download_sources
   resolve_sui_version
   resolve_certificates
-  check_existing_install
   print_summary_and_confirm
 
   ensure_docker
