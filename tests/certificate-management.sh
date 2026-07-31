@@ -30,6 +30,8 @@ CERT_SOURCE=/var/lib/s-ui-installer/generated-certs/${DOMAIN}/fullchain.pem
 KEY_SOURCE=/var/lib/s-ui-installer/generated-certs/${DOMAIN}/private.key
 CERT_DEST=${SUI_TEST_DIR}/cert/fullchain.pem
 KEY_DEST=${SUI_TEST_DIR}/cert/private.key
+CERT_IN_CONTAINER=/app/cert/fullchain.pem
+KEY_IN_CONTAINER=/app/cert/private.key
 SUI_VERSION=v1.5.4
 DETECTED_REGION=global
 BACKUP_ROOT=${BACKUP_TEST_ROOT}
@@ -38,7 +40,11 @@ chmod 0600 "$CONFIG"
 
 status_output="$(SUI_MANAGER_CONFIG="$CONFIG" CERT_SEARCH_ROOT="$SEARCH_ROOT" \
   "${ROOT}/scripts/s-ui-manager" cert-status)"
-grep -q "Installed cert:     ${SUI_TEST_DIR}/cert/fullchain.pem" \
+grep -q "Installed cert:     ${SUI_TEST_DIR}/cert/fullchain.pem (readable)" \
+  <<<"$status_output"
+grep -q "Container cert:     /app/cert/fullchain.pem (unavailable)" \
+  <<<"$status_output"
+grep -q "Container key:      /app/cert/private.key (unavailable)" \
   <<<"$status_output"
 
 auto_output="$(SUI_MANAGER_CONFIG="$CONFIG" CERT_SEARCH_ROOT="$SEARCH_ROOT" \

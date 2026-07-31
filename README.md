@@ -186,6 +186,23 @@ sudo s-ui-manager cert-auto
 sudo s-ui-manager cert-set /root/fullchain.pem /root/private.key
 ```
 
+`/root` 只是证书来源目录，并没有挂载进 S-UI 容器。管理器会验证证书后，
+把它们复制到安装状态中记录的 `CERT_DEST` 和 `KEY_DEST`；该目录通过
+Docker Compose 映射为容器内的 `/app/cert`。不要在面板中填写
+`/root/...`。
+
+如果面板提示 `/app/cert/DOMAIN.key is not exists`，先运行：
+
+```bash
+sudo s-ui-manager cert-status
+sudo s-ui-manager cert-set /root/DOMAIN.pem /root/DOMAIN.key
+sudo s-ui-manager cert-status
+```
+
+第二次状态检查中的 `Container cert` 和 `Container key` 都应显示
+`readable`。旧版安装状态没有记录容器路径时，管理器会根据宿主机目标
+文件名自动推导 `/app/cert/<文件名>`。
+
 后续 Certbot 或 acme.sh 在已经记录的来源路径续期后，执行：
 
 ```bash

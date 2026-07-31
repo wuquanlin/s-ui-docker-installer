@@ -14,6 +14,8 @@ warn() { printf '\n[!] %s\n' "$*" >&2; }
 die() { printf '\n[x] %s\n' "$*" >&2; exit 1; }
 timestamp() { date -u +%Y%m%dT%H%M%SZ; }
 CERT_SEARCH_ROOT="${CERT_SEARCH_ROOT:-/root}"
+CERT_IN_CONTAINER="${CERT_IN_CONTAINER:-/app/cert/$(basename "$CERT_DEST")}"
+KEY_IN_CONTAINER="${KEY_IN_CONTAINER:-/app/cert/$(basename "$KEY_DEST")}"
 
 [[ "$SUI_DIR" == /* && "$SUI_DIR" != "/" && "$SUI_DIR" != "/root" ]] ||
   die "Unsafe SUI_DIR in ${CONFIG_FILE}"
@@ -223,11 +225,40 @@ apply_certificate_pair() {
 }
 
 cert_status_cmd() {
+  local host_cert_status="MISSING"
+  local host_key_status="MISSING"
+  local container_cert_status="unavailable"
+  local container_key_status="unavailable"
+
+  [[ -r "$CERT_DEST" ]] && host_cert_status="readable"
+  [[ -r "$KEY_DEST" ]] && host_key_status="readable"
+
+  if docker inspect s-ui --format '{{.State.Running}}' 2>/dev/null |
+     grep -q true; then
+    if docker exec s-ui test -r "$CERT_IN_CONTAINER" >/dev/null 2>&1; then
+      container_cert_status="readable"
+    else
+      container_cert_status="MISSING"
+    fi
+    if docker exec s-ui test -r "$KEY_IN_CONTAINER" >/dev/null 2>&1; then
+      container_key_status="readable"
+    else
+      container_key_status="MISSING"
+    fi
+  elif docker inspect s-ui >/dev/null 2>&1; then
+    container_cert_status="container-stopped"
+    container_key_status="container-stopped"
+  fi
+
   printf 'Domain:             %s\n' "$DOMAIN"
   printf 'Configured source:  %s\n' "$CERT_SOURCE"
   printf 'Configured key:     %s\n' "$KEY_SOURCE"
-  printf 'Installed cert:     %s\n' "$CERT_DEST"
-  printf 'Installed key:      %s\n' "$KEY_DEST"
+  printf 'Installed cert:     %s (%s)\n' "$CERT_DEST" "$host_cert_status"
+  printf 'Installed key:      %s (%s)\n' "$KEY_DEST" "$host_key_status"
+  printf 'Container cert:     %s (%s)\n' \
+    "$CERT_IN_CONTAINER" "$container_cert_status"
+  printf 'Container key:      %s (%s)\n' \
+    "$KEY_IN_CONTAINER" "$container_key_status"
   printf 'Auto-search root:   %s\n' "$CERT_SEARCH_ROOT"
   printf '\nInstalled certificate:\n'
   openssl x509 -in "$CERT_DEST" -noout \
