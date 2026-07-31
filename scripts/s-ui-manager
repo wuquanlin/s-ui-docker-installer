@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CONFIG_FILE="/etc/s-ui-installer/config.env"
+CONFIG_FILE="${SUI_MANAGER_CONFIG:-/etc/s-ui-installer/config.env}"
 [[ -r "$CONFIG_FILE" ]] || {
   printf 'S-UI installer state not found: %s\n' "$CONFIG_FILE" >&2
   exit 1
@@ -13,6 +13,9 @@ log() { printf '\n[+] %s\n' "$*"; }
 warn() { printf '\n[!] %s\n' "$*" >&2; }
 die() { printf '\n[x] %s\n' "$*" >&2; exit 1; }
 timestamp() { date -u +%Y%m%dT%H%M%SZ; }
+CERT_SEARCH_ROOT="${CERT_SEARCH_ROOT:-/root}"
+CERT_IN_CONTAINER="${CERT_IN_CONTAINER:-/app/cert/$(basename "$CERT_DEST")}"
+KEY_IN_CONTAINER="${KEY_IN_CONTAINER:-/app/cert/$(basename "$KEY_DEST")}"
 
 [[ "$SUI_DIR" == /* && "$SUI_DIR" != "/" && "$SUI_DIR" != "/root" ]] ||
   die "Unsafe SUI_DIR in ${CONFIG_FILE}"
@@ -21,6 +24,268 @@ timestamp() { date -u +%Y%m%dT%H%M%SZ; }
 
 compose() {
   (cd "$SUI_DIR" && docker compose "$@")
+}
+
+certificate_public_key_hash() {
+  local certificate="$1"
+  openssl x509 -in "$certificate" -pubkey -noout 2>/dev/null |
+    openssl pkey -pubin -outform pem 2>/dev/null |
+    sha256sum | awk '{print $1}'
+}
+
+private_key_public_hash() {
+  local private_key="$1"
+  openssl pkey -in "$private_key" -pubout -outform pem 2>/dev/null |
+    sha256sum | awk '{print $1}'
+}
+
+certificate_pair_is_valid() {
+  local certificate="$1"
+  local private_key="$2"
+  local certificate_hash=""
+  local private_key_hash=""
+
+  [[ -f "$certificate" && -f "$private_key" ]] || return 1
+  openssl x509 -in "$certificate" -noout >/dev/null 2>&1 || return 1
+  openssl pkey -in "$private_key" -noout >/dev/null 2>&1 || return 1
+  certificate_hash="$(certificate_public_key_hash "$certificate")"
+  private_key_hash="$(private_key_public_hash "$private_key")"
+  [[ -n "$certificate_hash" && "$certificate_hash" == "$private_key_hash" ]] ||
+    return 1
+  openssl x509 -in "$certificate" -noout -checkhost "$DOMAIN" 2>/dev/null |
+    grep -q 'does match' || return 1
+  openssl x509 -checkend 0 -noout -in "$certificate" >/dev/null 2>&1
+}
+
+validate_certificate_pair() {
+  local certificate="$1"
+  local private_key="$2"
+  local certificate_hash=""
+  local private_key_hash=""
+
+  [[ -f "$certificate" ]] || die "Certificate file not found: ${certificate}"
+  [[ -f "$private_key" ]] || die "Private key file not found: ${private_key}"
+  openssl x509 -in "$certificate" -noout >/dev/null 2>&1 ||
+    die "Invalid certificate PEM: ${certificate}"
+  openssl pkey -in "$private_key" -noout >/dev/null 2>&1 ||
+    die "Invalid private key PEM: ${private_key}"
+  certificate_hash="$(certificate_public_key_hash "$certificate")"
+  private_key_hash="$(private_key_public_hash "$private_key")"
+  [[ -n "$certificate_hash" && "$certificate_hash" == "$private_key_hash" ]] ||
+    die "Certificate and private key do not match"
+  openssl x509 -in "$certificate" -noout -checkhost "$DOMAIN" 2>/dev/null |
+    grep -q 'does match' ||
+    die "Certificate does not match ${DOMAIN}"
+  openssl x509 -checkend 0 -noout -in "$certificate" >/dev/null 2>&1 ||
+    die "Certificate is expired"
+  if ! openssl x509 -checkend 1209600 -noout -in "$certificate" >/dev/null 2>&1; then
+    warn "Certificate expires within 14 days"
+  fi
+}
+
+find_certificate_pair() {
+  FOUND_CERT=""
+  FOUND_KEY=""
+  local certificate=""
+  local private_key=""
+
+  while IFS='|' read -r certificate private_key; do
+    [[ -n "$certificate" ]] || continue
+    if certificate_pair_is_valid "$certificate" "$private_key"; then
+      FOUND_CERT="$certificate"
+      FOUND_KEY="$private_key"
+      return 0
+    fi
+  done <<EOF
+/etc/letsencrypt/live/${DOMAIN}/fullchain.pem|/etc/letsencrypt/live/${DOMAIN}/privkey.pem
+${CERT_SEARCH_ROOT}/.acme.sh/${DOMAIN}_ecc/fullchain.cer|${CERT_SEARCH_ROOT}/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key
+${CERT_SEARCH_ROOT}/.acme.sh/${DOMAIN}/fullchain.cer|${CERT_SEARCH_ROOT}/.acme.sh/${DOMAIN}/${DOMAIN}.key
+${CERT_SEARCH_ROOT}/${DOMAIN}.pem|${CERT_SEARCH_ROOT}/${DOMAIN}.key
+${CERT_SEARCH_ROOT}/fullchain.pem|${CERT_SEARCH_ROOT}/privkey.pem
+EOF
+
+  for certificate in \
+    "${CERT_SEARCH_ROOT}"/*.pem \
+    "${CERT_SEARCH_ROOT}"/*.crt \
+    "${CERT_SEARCH_ROOT}"/*.cer; do
+    [[ -f "$certificate" ]] || continue
+    for private_key in \
+      "${certificate%.*}.key" \
+      "${CERT_SEARCH_ROOT}"/privkey.pem \
+      "${CERT_SEARCH_ROOT}"/*.key \
+      "${CERT_SEARCH_ROOT}"/*key*.pem; do
+      [[ -f "$private_key" ]] || continue
+      if certificate_pair_is_valid "$certificate" "$private_key"; then
+        FOUND_CERT="$certificate"
+        FOUND_KEY="$private_key"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+update_certificate_source_config() {
+  local certificate="$1"
+  local private_key="$2"
+  local temp=""
+  temp="$(mktemp)"
+  awk '!/^(CERT_SOURCE|KEY_SOURCE)=/' "$CONFIG_FILE" >"$temp"
+  {
+    printf 'CERT_SOURCE=%q\n' "$certificate"
+    printf 'KEY_SOURCE=%q\n' "$private_key"
+  } >>"$temp"
+  install -m 0600 "$temp" "$CONFIG_FILE"
+  rm -f "$temp"
+  CERT_SOURCE="$certificate"
+  KEY_SOURCE="$private_key"
+}
+
+backup_current_certificate() {
+  local target=""
+  target="${BACKUP_ROOT}/certificates/$(timestamp)"
+  install -m 0700 -d "$target"
+  [[ -f "$CERT_DEST" ]] &&
+    cp -a "$CERT_DEST" "${target}/certificate.pem"
+  [[ -f "$KEY_DEST" ]] &&
+    cp -a "$KEY_DEST" "${target}/private.key"
+  printf '%s' "$target"
+}
+
+wait_for_loaded_certificate() {
+  local expected_fingerprint="$1"
+  local loaded_certificate=""
+  local loaded_fingerprint=""
+  local _attempt=0
+
+  for _attempt in $(seq 1 20); do
+    loaded_certificate="$(timeout 5 openssl s_client \
+      -connect "127.0.0.1:${WEB_PORT}" \
+      -servername "$DOMAIN" </dev/null 2>/dev/null |
+      openssl x509 -outform PEM 2>/dev/null || true)"
+    if [[ -n "$loaded_certificate" ]]; then
+      loaded_fingerprint="$(printf '%s' "$loaded_certificate" |
+        openssl x509 -noout -fingerprint -sha256 2>/dev/null |
+        cut -d= -f2)"
+      [[ "$loaded_fingerprint" == "$expected_fingerprint" ]] && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+apply_certificate_pair() {
+  local certificate="$1"
+  local private_key="$2"
+  local update_source="${3:-0}"
+  local changed=0
+  local backup_dir=""
+  local expected_fingerprint=""
+
+  validate_certificate_pair "$certificate" "$private_key"
+  cmp -s "$certificate" "$CERT_DEST" || changed=1
+  cmp -s "$private_key" "$KEY_DEST" || changed=1
+
+  if (( changed == 0 )); then
+    if [[ "$update_source" == "1" ]]; then
+      update_certificate_source_config "$certificate" "$private_key"
+    fi
+    printf 'Certificate content is already installed.\n'
+    printf 'Source:      %s\n' "$certificate"
+    printf 'Private key: %s\n' "$private_key"
+    return 0
+  fi
+
+  backup_dir="$(backup_current_certificate)"
+  install -m 0644 "$certificate" "${CERT_DEST}.new"
+  install -m 0600 "$private_key" "${KEY_DEST}.new"
+  mv -f "${CERT_DEST}.new" "$CERT_DEST"
+  mv -f "${KEY_DEST}.new" "$KEY_DEST"
+  expected_fingerprint="$(openssl x509 -in "$CERT_DEST" \
+    -noout -fingerprint -sha256 | cut -d= -f2)"
+
+  if compose restart s-ui &&
+     wait_for_loaded_certificate "$expected_fingerprint"; then
+    if [[ "$update_source" == "1" ]]; then
+      update_certificate_source_config "$certificate" "$private_key"
+    fi
+    log "Certificate updated, loaded, and verified"
+    printf 'Source: %s\n' "$certificate"
+    printf 'Backup: %s\n' "$backup_dir"
+    return 0
+  fi
+
+  warn "New certificate was not loaded; restoring previous certificate"
+  [[ -f "${backup_dir}/certificate.pem" ]] &&
+    install -m 0644 "${backup_dir}/certificate.pem" "$CERT_DEST"
+  [[ -f "${backup_dir}/private.key" ]] &&
+    install -m 0600 "${backup_dir}/private.key" "$KEY_DEST"
+  compose restart s-ui || true
+  die "Certificate update failed and was rolled back"
+}
+
+cert_status_cmd() {
+  local host_cert_status="MISSING"
+  local host_key_status="MISSING"
+  local container_cert_status="unavailable"
+  local container_key_status="unavailable"
+
+  [[ -r "$CERT_DEST" ]] && host_cert_status="readable"
+  [[ -r "$KEY_DEST" ]] && host_key_status="readable"
+
+  if docker inspect s-ui --format '{{.State.Running}}' 2>/dev/null |
+     grep -q true; then
+    if docker exec s-ui test -r "$CERT_IN_CONTAINER" >/dev/null 2>&1; then
+      container_cert_status="readable"
+    else
+      container_cert_status="MISSING"
+    fi
+    if docker exec s-ui test -r "$KEY_IN_CONTAINER" >/dev/null 2>&1; then
+      container_key_status="readable"
+    else
+      container_key_status="MISSING"
+    fi
+  elif docker inspect s-ui >/dev/null 2>&1; then
+    container_cert_status="container-stopped"
+    container_key_status="container-stopped"
+  fi
+
+  printf 'Domain:             %s\n' "$DOMAIN"
+  printf 'Configured source:  %s\n' "$CERT_SOURCE"
+  printf 'Configured key:     %s\n' "$KEY_SOURCE"
+  printf 'Installed cert:     %s (%s)\n' "$CERT_DEST" "$host_cert_status"
+  printf 'Installed key:      %s (%s)\n' "$KEY_DEST" "$host_key_status"
+  printf 'Container cert:     %s (%s)\n' \
+    "$CERT_IN_CONTAINER" "$container_cert_status"
+  printf 'Container key:      %s (%s)\n' \
+    "$KEY_IN_CONTAINER" "$container_key_status"
+  printf 'Auto-search root:   %s\n' "$CERT_SEARCH_ROOT"
+  printf '\nInstalled certificate:\n'
+  openssl x509 -in "$CERT_DEST" -noout \
+    -subject -issuer -dates -fingerprint -sha256 \
+    -ext subjectAltName 2>/dev/null ||
+    warn "Installed certificate is unavailable or invalid"
+  printf '\nUpdate commands:\n'
+  printf '  s-ui-manager cert-auto\n'
+  printf '  s-ui-manager cert-set /path/fullchain.pem /path/private.key\n'
+  printf '  s-ui-manager cert-sync\n'
+}
+
+cert_auto_cmd() {
+  log "Searching for a valid certificate matching ${DOMAIN}"
+  find_certificate_pair ||
+    die "No valid matching certificate pair found in Certbot, acme.sh, or ${CERT_SEARCH_ROOT}"
+  printf 'Found certificate: %s\n' "$FOUND_CERT"
+  printf 'Found private key: %s\n' "$FOUND_KEY"
+  apply_certificate_pair "$FOUND_CERT" "$FOUND_KEY" 1
+}
+
+cert_set_cmd() {
+  local certificate="${1:-}"
+  local private_key="${2:-}"
+  [[ -n "$certificate" && -n "$private_key" ]] ||
+    die "Usage: s-ui-manager cert-set CERTIFICATE PRIVATE_KEY"
+  apply_certificate_pair "$certificate" "$private_key" 1
 }
 
 status_cmd() {
@@ -120,30 +385,20 @@ restore_cmd() {
 }
 
 cert_sync_cmd() {
-  [[ -f "$CERT_SOURCE" && -f "$KEY_SOURCE" ]] || {
-    warn "Certificate source is unavailable; skipped"
+  if [[ $# -eq 2 ]]; then
+    cert_set_cmd "$1" "$2"
     return 0
-  }
-  openssl x509 -in "$CERT_SOURCE" -noout >/dev/null 2>&1 ||
-    die "Source certificate is invalid"
-  openssl pkey -in "$KEY_SOURCE" -noout >/dev/null 2>&1 ||
-    die "Source private key is invalid"
-
-  local changed=0
-  cmp -s "$CERT_SOURCE" "$CERT_DEST" || {
-    install -m 0644 "$CERT_SOURCE" "$CERT_DEST"
-    changed=1
-  }
-  cmp -s "$KEY_SOURCE" "$KEY_DEST" || {
-    install -m 0600 "$KEY_SOURCE" "$KEY_DEST"
-    changed=1
-  }
-  if (( changed == 1 )); then
-    compose restart s-ui
-    log "Certificate synchronized and S-UI restarted"
-  else
-    printf 'Certificate is already current.\n'
   fi
+  [[ $# -eq 0 ]] ||
+    die "Usage: s-ui-manager cert-sync [CERTIFICATE PRIVATE_KEY]"
+  [[ -f "$CERT_SOURCE" && -f "$KEY_SOURCE" ]] || {
+    warn "Configured certificate source is unavailable"
+    printf 'Configured source: %s\n' "$CERT_SOURCE"
+    printf 'Configured key:    %s\n' "$KEY_SOURCE"
+    printf 'Run: s-ui-manager cert-auto\n'
+    return 1
+  }
+  apply_certificate_pair "$CERT_SOURCE" "$KEY_SOURCE" 0
 }
 
 update_cmd() {
@@ -211,7 +466,10 @@ Commands:
   update                 Backup and update to latest official S-UI
   backup                 Create an online SQLite/config/certificate backup
   restore DIR            Restore a backup after creating a safety backup
-  cert-sync              Copy renewed source certificate and restart if changed
+  cert-status            Show certificate source, destination, and validity
+  cert-auto              Find a matching certificate and make it the new source
+  cert-set CERT KEY      Validate and install an explicit certificate pair
+  cert-sync [CERT KEY]   Sync the configured source, or set an explicit pair
   restart|start|stop     Control the S-UI container
   uninstall              Stop S-UI but preserve all data and backups
 EOF
@@ -224,7 +482,10 @@ case "${1:-}" in
   update) update_cmd ;;
   backup) backup_cmd ;;
   restore) restore_cmd "${2:-}" ;;
-  cert-sync) cert_sync_cmd ;;
+  cert-status) cert_status_cmd ;;
+  cert-auto) cert_auto_cmd ;;
+  cert-set) shift; cert_set_cmd "$@" ;;
+  cert-sync) shift; cert_sync_cmd "$@" ;;
   restart) compose restart s-ui ;;
   start) compose up -d ;;
   stop) compose stop s-ui ;;

@@ -21,6 +21,7 @@ jobs:
         run: |
           bash tests/smoke.sh
           bash tests/network-selection.sh
+          bash tests/certificate-management.sh
 
   secret-scan:
     runs-on: ubuntu-latest
