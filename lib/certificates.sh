@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+SKIP_CERT_HOST_CHECK="${SKIP_CERT_HOST_CHECK:-0}"
+
 certificate_matches_key() {
   local cert="$1"
   local key="$2"
@@ -8,7 +10,8 @@ certificate_matches_key() {
   cert_hash="$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null |
     openssl pkey -pubin -outform pem 2>/dev/null |
     sha256sum | awk '{print $1}')"
-  key_hash="$(openssl pkey -in "$key" -pubout -outform pem 2>/dev/null |
+  key_hash="$(openssl pkey -in "$key" -passin pass: \
+    -pubout -outform pem 2>/dev/null |
     sha256sum | awk '{print $1}')"
   [[ -n "$cert_hash" && "$cert_hash" == "$key_hash" ]]
 }
@@ -19,14 +22,66 @@ certificate_matches_domain() {
     grep -q 'does match'
 }
 
+certificate_file_is_valid() {
+  local cert="$1"
+  CERT_VALIDATION_ERROR=""
+
+  if [[ ! -f "$cert" ]]; then
+    CERT_VALIDATION_ERROR="证书文件不存在：${cert}"
+    return 1
+  fi
+  if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+    CERT_VALIDATION_ERROR="证书不是有效的 PEM/X.509 文件：${cert}"
+    return 1
+  fi
+  if ! openssl x509 -checkend 0 -noout -in "$cert" >/dev/null 2>&1; then
+    CERT_VALIDATION_ERROR="证书已经过期：${cert}"
+    return 1
+  fi
+  if [[ "$SKIP_CERT_HOST_CHECK" != "1" ]] &&
+     ! certificate_matches_domain "$cert"; then
+    CERT_VALIDATION_ERROR="证书不匹配域名 ${DOMAIN}：${cert}"
+    return 1
+  fi
+}
+
+private_key_file_is_valid() {
+  local key="$1"
+  KEY_VALIDATION_ERROR=""
+
+  if [[ ! -f "$key" ]]; then
+    KEY_VALIDATION_ERROR="私钥文件不存在：${key}"
+    return 1
+  fi
+  if ! openssl pkey -in "$key" -passin pass: -noout >/dev/null 2>&1; then
+    KEY_VALIDATION_ERROR="私钥不是可无人值守读取的有效 PEM：${key}"
+    return 1
+  fi
+}
+
+certificate_pair_is_valid() {
+  local cert="$1"
+  local key="$2"
+  PAIR_VALIDATION_ERROR=""
+
+  certificate_file_is_valid "$cert" || {
+    PAIR_VALIDATION_ERROR="$CERT_VALIDATION_ERROR"
+    return 1
+  }
+  private_key_file_is_valid "$key" || {
+    PAIR_VALIDATION_ERROR="$KEY_VALIDATION_ERROR"
+    return 1
+  }
+  if ! certificate_matches_key "$cert" "$key"; then
+    PAIR_VALIDATION_ERROR="证书和私钥不匹配"
+    return 1
+  fi
+}
+
 try_certificate_pair() {
   local cert="$1"
   local key="$2"
-  [[ -f "$cert" && -f "$key" ]] || return 1
-  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
-  openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
-  certificate_matches_key "$cert" "$key" || return 1
-  certificate_matches_domain "$cert" || return 1
+  certificate_pair_is_valid "$cert" "$key" || return 1
   CERT_SRC="$cert"
   KEY_SRC="$key"
 }
@@ -119,21 +174,19 @@ resolve_certificates() {
     fi
   fi
 
-  [[ -f "$CERT_SRC" ]] || die "证书文件不存在：${CERT_SRC}"
-  [[ -f "$KEY_SRC" ]] || die "私钥文件不存在：${KEY_SRC}"
-  openssl x509 -in "$CERT_SRC" -noout >/dev/null 2>&1 ||
-    die "证书 PEM 无效：${CERT_SRC}"
-  openssl pkey -in "$KEY_SRC" -noout >/dev/null 2>&1 ||
-    die "私钥 PEM 无效：${KEY_SRC}"
-  certificate_matches_key "$CERT_SRC" "$KEY_SRC" ||
-    die "证书和私钥不匹配"
-
-  if ! certificate_matches_domain "$CERT_SRC"; then
-    if [[ "$CERT_MODE" == "example" ]]; then
-      warn "开发示例证书不会匹配真实域名"
-    elif [[ "$SKIP_CERT_HOST_CHECK" != "1" ]]; then
-      die "证书不匹配 ${DOMAIN}；如确实需要可用 --skip-cert-host-check"
-    fi
+  if [[ "$CERT_MODE" == "example" ]]; then
+    [[ -f "$CERT_SRC" && -f "$KEY_SRC" ]] ||
+      die "开发示例证书不完整"
+    openssl x509 -in "$CERT_SRC" -noout >/dev/null 2>&1 ||
+      die "开发示例证书无效"
+    private_key_file_is_valid "$KEY_SRC" ||
+      die "$KEY_VALIDATION_ERROR"
+    certificate_matches_key "$CERT_SRC" "$KEY_SRC" ||
+      die "开发示例证书和私钥不匹配"
+    warn "开发示例证书不会匹配真实域名"
+  else
+    certificate_pair_is_valid "$CERT_SRC" "$KEY_SRC" ||
+      die "$PAIR_VALIDATION_ERROR"
   fi
 
   if ! openssl x509 -checkend 1209600 -noout -in "$CERT_SRC" >/dev/null 2>&1; then

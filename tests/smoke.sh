@@ -7,7 +7,9 @@ while IFS= read -r script; do
   bash -n "$script"
 done < <(find "$ROOT" -type f -name '*.sh' -o -path "$ROOT/install.sh")
 
-"${ROOT}/install.sh" --help >/dev/null
+help_output="$("${ROOT}/install.sh" --help)"
+grep -q -- '--expected-ip IP' <<<"$help_output"
+grep -q -- '--skip-domain-ip-check' <<<"$help_output"
 "${ROOT}/scripts/s-ui-manager" --help >/dev/null 2>&1 || {
   # Manager correctly requires installed state; syntax is checked above.
   true
