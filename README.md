@@ -164,10 +164,40 @@ certs/live/private.key
 
 随后会扫描 `/root`，但只有同时通过证书格式、私钥匹配和域名匹配的组合才会采用。
 
-如果自动生成了自签名证书，后续把正式证书放到原来源路径，再运行：
+查看 S-UI 当前记录的证书来源、实际安装位置和有效期：
+
+```bash
+sudo s-ui-manager cert-status
+```
+
+把匹配域名的证书和私钥放入 `/root` 后，可以重新自动扫描并切换来源：
+
+```bash
+sudo s-ui-manager cert-auto
+```
+
+自动扫描支持 `/root/DOMAIN.pem + /root/DOMAIN.key`，也会尝试 `/root` 下其他
+`.pem`、`.crt`、`.cer` 和 `.key` 组合，但只接受格式有效、证书与私钥匹配、
+未过期且匹配当前域名的组合。
+
+也可以直接指定路径：
+
+```bash
+sudo s-ui-manager cert-set /root/fullchain.pem /root/private.key
+```
+
+后续 Certbot 或 acme.sh 在已经记录的来源路径续期后，执行：
 
 ```bash
 sudo s-ui-manager cert-sync
+```
+
+切换证书前会备份当前证书。新证书重启后未被面板实际加载时，会自动恢复旧证书。
+
+从 `v1.0.0` 升级管理工具而不重新安装 S-UI：
+
+```bash
+sudo install -m 0755 scripts/s-ui-manager /usr/local/sbin/s-ui-manager
 ```
 
 ## 管理命令
@@ -179,6 +209,9 @@ s-ui-manager logs
 s-ui-manager update
 s-ui-manager backup
 s-ui-manager restore /var/backups/s-ui-installer/TIMESTAMP
+s-ui-manager cert-status
+s-ui-manager cert-auto
+s-ui-manager cert-set /path/fullchain.pem /path/private.key
 s-ui-manager cert-sync
 s-ui-manager restart
 s-ui-manager stop
